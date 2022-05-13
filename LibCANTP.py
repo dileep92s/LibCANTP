@@ -1,5 +1,4 @@
 import time
-from typing import overload
 import can
 
 from threading import Thread
@@ -10,7 +9,7 @@ class CANTP(can.Listener):
 
     class Observer(ABC):
         @abstractmethod
-        def update(self, data):
+        def on_cantp_msg_received(self, data):
             pass
 
     # -- can.Listener Overrides --
@@ -75,28 +74,21 @@ class CANTP(can.Listener):
 
     def notify(self):
         for observer in self.observers:
-            observer.update(self.rx_data)
+            observer.on_cantp_msg_received(self.rx_data[:self.rx_data_size])
 
     ## Read Data
     def readSingleFrame(self, data):
-        size = data[0]
-        self.rx_data = [hex(byte) for byte in bytes(data[1: size+1])]
+        self.rx_data_size = data[0]
+        self.rx_data = data[1:]
         self.notify()
     
     def readFirstFrame(self, data):
         self.rx_data_size = ((data[0] & 0x0F) << 8) | data[1]
-        self.rx_data = [hex(byte) for byte in bytes(data[2: 8])]
-        self.rx_data_size -= (8-2)
+        self.rx_data = data[2:]
 
     def readConsecutiveFrame(self, data):
-        if self.rx_data_size >= 7:
-            self.rx_data += [hex(byte) for byte in bytes(data[1: 8])]
-            self.rx_data_size -= (8-1)
-        else:
-            self.rx_data += [hex(byte) for byte in bytes(data[1: self.rx_data_size+1])]
-            self.rx_data_size -= self.rx_data_size
-
-        if self.rx_data_size == 0:
+        self.rx_data += data[1:]
+        if len(self.rx_data) >= self.rx_data_size:
             self.notify()
 
     def readFlowControlFrame(self, data):
@@ -173,17 +165,16 @@ class CANTP(can.Listener):
     # API for writing data
     def sendData(self, data):
         if len(data) < 8:
-            th = Thread(target=self.writeSingleFrame(data))
+            self.writeSingleFrame(data)
         else:
             th = Thread(target=self.writeMultiFrame(data))
-
-        th.start()
-        th.join()
+            th.start()
+            th.join()
 
 
 class DiagRx(CANTP.Observer):
-    def update(self, data):
-        print("notf", data)
+    def on_cantp_msg_received(self, data):
+        print("notf : " + " ".join([hex(byte) for byte in data]))
 
 bus2 = can.Bus('test', bustype='virtual')
 tp2 = CANTP(bus2, 0x72F, 0x727)
@@ -198,6 +189,8 @@ tp.sendData(data)
 data = [0x0a, 0x0b, 0x0c]
 tp.sendData(data)
 data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]
+tp.sendData(data)
+data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
 tp.sendData(data)
 
 while True:
