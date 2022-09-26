@@ -14,7 +14,7 @@ class CANTP(can.Listener):
 
     # -- can.Listener Overrides --
     def on_error(self, exc: Exception) -> None:
-        self.logger.log_error(f"CANTP::error : {exc}")
+        print(f"CANTP::error : {exc}")
         return super().on_error(exc)
 
     def on_message_received(self, msg) -> None:
@@ -23,7 +23,7 @@ class CANTP(can.Listener):
 
         if can_id == self.rxid:
             log_msg = "RX    -    ID: {:04X}    DL: {:02X}    Data: {}".format(can_id, msg.dlc, " ".join(["{:02X} ".format(byte) for byte in msg.data]))
-            self.logger.log_debug(log_msg)
+            print(log_msg)
 
             if data[0] & 0xF0 == 0x00:
                 self.readSingleFrame(data)
@@ -47,11 +47,9 @@ class CANTP(can.Listener):
                 self.readFlowControlFrame(data)
                 return
 
-    def getRxFilter(self):
-        return [{"can_id": self.rxid, "can_mask": 0xFFFFFFFF, "extended": True if (0x80000000 & self.rxid) else False}]
 
     # -- Init --
-    def __init__(self, canio, txid, rxid, logger):
+    def __init__(self, bus, txid, rxid):
         self.flow_ctrl_ok = Event()
         self.st_min_for_tx = 0x14 # 20ms
         self.st_min_for_rx = 0x14 # 20ms
@@ -63,8 +61,8 @@ class CANTP(can.Listener):
         self.received_blocks = 0
         self.txid, self.rxid = txid, rxid
         self.observers = []
-        self.canio = canio
-        self.logger = logger
+        self.bus = bus
+
 
     # -- API for reading data - register as observer --
     def addObserver(self, observer:Observer):
@@ -73,7 +71,7 @@ class CANTP(can.Listener):
     def notify(self):
         payload = self.rx_data[:self.rx_data_size]
         payload_str = " ".join(["{:02X}".format(byte) for byte in payload])
-        self.logger.log_debug(f"CANTP::notify - {payload_str}")
+        print(f"CANTP::notify - {payload_str}")
         for observer in self.observers:
             observer.on_cantp_msg_received(payload)
 
@@ -100,7 +98,7 @@ class CANTP(can.Listener):
     ## -- Write Data --
     def sendMessage(self, msg):
         msg = can.Message(arbitration_id=self.txid, data=msg, is_extended_id=False)
-        self.canio.sendRawMessage(msg)
+        self.bus.send(msg)
 
     def writeSingleFrame(self, data):
         data_len = len(data)
@@ -154,7 +152,7 @@ class CANTP(can.Listener):
                     block_count = 0
 
             elif timeout > 10:
-                self.logger.log_error("CANTP::writeMultiFrame : flow ctrl timeout")
+                print("CANTP::writeMultiFrame : flow ctrl timeout")
                 break
 
     # -- API for writing data --
@@ -164,27 +162,35 @@ class CANTP(can.Listener):
         else:
             th = Thread(target=self.writeMultiFrame(data))
             th.start()
-
+            th.join() # remove in production env
 class DiagRx(CANTP.Observer):
     def on_cantp_msg_received(self, data):
-        print("notf : " + " ".join([hex(byte) for byte in data]))
+        # print("notf : " + " ".join([hex(byte) for byte in data]))
+        pass
+
+
+# ------------------- TESTING ------------------- #
+rx = DiagRx()
 
 bus2 = can.Bus('test', bustype='virtual')
 tp2 = CANTP(bus2, 0x72F, 0x727)
-rx = DiagRx()
+can.Notifier(bus2, [tp2])
 tp2.addObserver(rx)
 
-bus = can.Bus('test', bustype='virtual')
-tp = CANTP(bus, 0x727, 0x72F)
+bus1 = can.Bus('test', bustype='virtual')
+tp1 = CANTP(bus1, 0x727, 0x72F)
+can.Notifier(bus1, [tp1])
+tp1.addObserver(rx)
 
 data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]
-tp.sendData(data)
+tp1.sendData(data)
 data = [0x0a, 0x0b, 0x0c]
-tp.sendData(data)
+tp1.sendData(data)
+
 data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]
-tp.sendData(data)
+tp2.sendData(data)
 data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
-tp.sendData(data)
+tp2.sendData(data)
 
 while True:
     time.sleep(1)
