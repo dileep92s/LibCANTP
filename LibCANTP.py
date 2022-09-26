@@ -7,11 +7,27 @@ from abc import ABC, abstractmethod
 
 class CANTP(can.Listener):
 
+    # ------------------- OBSERVER ------------------- #
     class Observer(ABC):
         @abstractmethod
         def on_cantp_msg_received(self, data):
             pass
 
+    # ------------------- NOTIFIER ------------------- #
+
+    # -- API for reading data - register as observer --
+    def addObserver(self, observer:Observer):
+        self.observers.append(observer)
+
+    def notify(self):
+        payload = self.rx_data[:self.rx_data_size]
+        payload_str = " ".join(["{:02X}".format(byte) for byte in payload])
+        print(f"CANTP::notify - {payload_str}")
+        for observer in self.observers:
+            observer.on_cantp_msg_received(payload)
+
+    # ------------------- LISTENER ------------------- #
+    
     # -- can.Listener Overrides --
     def on_error(self, exc: Exception) -> None:
         print(f"CANTP::error : {exc}")
@@ -46,8 +62,9 @@ class CANTP(can.Listener):
             if data[0] & 0xF0 == 0x30:
                 self.readFlowControlFrame(data)
                 return
-
-
+            
+    # ------------------- CANTP STUFF ------------------- #
+            
     # -- Init --
     def __init__(self, bus, txid, rxid):
         self.flow_ctrl_ok = Event()
@@ -62,18 +79,6 @@ class CANTP(can.Listener):
         self.txid, self.rxid = txid, rxid
         self.observers = []
         self.bus = bus
-
-
-    # -- API for reading data - register as observer --
-    def addObserver(self, observer:Observer):
-        self.observers.append(observer)
-
-    def notify(self):
-        payload = self.rx_data[:self.rx_data_size]
-        payload_str = " ".join(["{:02X}".format(byte) for byte in payload])
-        print(f"CANTP::notify - {payload_str}")
-        for observer in self.observers:
-            observer.on_cantp_msg_received(payload)
 
     ## -- Read Data --
     def readSingleFrame(self, data):
@@ -163,6 +168,9 @@ class CANTP(can.Listener):
             th = Thread(target=self.writeMultiFrame(data))
             th.start()
             th.join() # remove in production env
+
+
+# ------------------- LISTENER ------------------- #
 class DiagRx(CANTP.Observer):
     def on_cantp_msg_received(self, data):
         # print("notf : " + " ".join([hex(byte) for byte in data]))
@@ -170,7 +178,7 @@ class DiagRx(CANTP.Observer):
 
 
 # ------------------- TESTING ------------------- #
-rx = DiagRx()
+rx = DiagRx(CANTP.Observer)
 
 bus2 = can.Bus('test', bustype='virtual')
 tp2 = CANTP(bus2, 0x72F, 0x727)
