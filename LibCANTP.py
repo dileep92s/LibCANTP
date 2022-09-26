@@ -2,7 +2,7 @@ import time
 import can
 
 from threading import Thread
-from threading import Condition
+from threading import Event
 from abc import ABC, abstractmethod
 
 class CANTP(can.Listener):
@@ -13,47 +13,48 @@ class CANTP(can.Listener):
             pass
 
     # -- can.Listener Overrides --
-
     def on_error(self, exc: Exception) -> None:
-        print(exc)
+        self.logger.log_error(f"CANTP::error : {exc}")
         return super().on_error(exc)
 
     def on_message_received(self, msg) -> None:
-        print(msg)
-
-        id = msg.arbitration_id
+        can_id = msg.arbitration_id
         data = msg.data
 
-        if id == self.rxid:
+        if can_id == self.rxid:
+            log_msg = "RX    -    ID: {:04X}    DL: {:02X}    Data: {}".format(can_id, msg.dlc, " ".join(["{:02X} ".format(byte) for byte in msg.data]))
+            self.logger.log_debug(log_msg)
 
             if data[0] & 0xF0 == 0x00:
-                self.received_blocks = 0
                 self.readSingleFrame(data)
                 return
 
             if data[0] & 0xF0 == 0x10:
+                self.received_blocks = 0
                 self.readFirstFrame(data)
+                time.sleep(self.st_min_for_rx/10e3)
                 self.writeFlowControlFrame()
                 return
-            
+
             if data[0] & 0xF0 == 0x20:
                 self.received_blocks += 1
                 self.readConsecutiveFrame(data)
                 time.sleep(self.st_min_for_rx/10e3)
-                if (self.received_blocks % self.blk_size_for_rx) == 0 and self.rx_data_size:
+                if not (self.received_blocks % self.blk_size_for_rx):
                     self.writeFlowControlFrame()
 
             if data[0] & 0xF0 == 0x30:
                 self.readFlowControlFrame(data)
                 return
 
-    # Init
+    def getRxFilter(self):
+        return [{"can_id": self.rxid, "can_mask": 0xFFFFFFFF, "extended": True if (0x80000000 & self.rxid) else False}]
 
-    def __init__(self, bus, txid, rxid):
-        self.tx_cond = Condition()
-        self.flow_ctrl_ok = False
-        self.st_min_for_tx = 0x64
-        self.st_min_for_rx = 0x64
+    # -- Init --
+    def __init__(self, canio, txid, rxid, logger):
+        self.flow_ctrl_ok = Event()
+        self.st_min_for_tx = 0x14 # 20ms
+        self.st_min_for_rx = 0x14 # 20ms
         self.blk_size_for_tx = 4
         self.blk_size_for_rx = 4
         self.rx_data = []
@@ -62,48 +63,45 @@ class CANTP(can.Listener):
         self.received_blocks = 0
         self.txid, self.rxid = txid, rxid
         self.observers = []
+        self.canio = canio
+        self.logger = logger
 
-        self.bus = bus
-        can.Notifier(self.bus, [self])
-
-
-    # API for reading data - register as observer
-
+    # -- API for reading data - register as observer --
     def addObserver(self, observer:Observer):
         self.observers.append(observer)
 
     def notify(self):
+        payload = self.rx_data[:self.rx_data_size]
+        payload_str = " ".join(["{:02X}".format(byte) for byte in payload])
+        self.logger.log_debug(f"CANTP::notify - {payload_str}")
         for observer in self.observers:
-            observer.on_cantp_msg_received(self.rx_data[:self.rx_data_size])
+            observer.on_cantp_msg_received(payload)
 
-    ## Read Data
+    ## -- Read Data --
     def readSingleFrame(self, data):
         self.rx_data_size = data[0]
-        self.rx_data = data[1:]
+        self.rx_data = [byte for byte in bytes(data[1:])]
         self.notify()
-    
+
     def readFirstFrame(self, data):
         self.rx_data_size = ((data[0] & 0x0F) << 8) | data[1]
-        self.rx_data = data[2:]
+        self.rx_data = [byte for byte in bytes(data[2:])]
 
     def readConsecutiveFrame(self, data):
-        self.rx_data += data[1:]
+        self.rx_data += [byte for byte in bytes(data[1:])]
         if len(self.rx_data) >= self.rx_data_size:
             self.notify()
 
     def readFlowControlFrame(self, data):
-        self.flow_ctrl_ok = True
         self.st_min_for_tx = (data[2] / 10e3) if (data[2] <= 0x7F) else (self.st_min_for_tx + (data[2] / 10e6))
         self.blk_size_for_tx = data[1] if data[1] else self.max_blk_size
-        with self.tx_cond:
-            self.tx_cond.notify_all()
+        self.flow_ctrl_ok.set()
 
-    ## Write Data
-
+    ## -- Write Data --
     def sendMessage(self, msg):
         msg = can.Message(arbitration_id=self.txid, data=msg, is_extended_id=False)
-        self.bus.send(msg)
-    
+        self.canio.sendRawMessage(msg)
+
     def writeSingleFrame(self, data):
         data_len = len(data)
         msg = [data_len] + data
@@ -134,43 +132,38 @@ class CANTP(can.Listener):
     def writeMultiFrame(self, data):
         # reset
         block_count = 0
-        self.flow_ctrl_ok = False
-
+        self.flow_ctrl_ok.clear()
         # send first frame
         data = self.writeFirstFrame(data)
         data_len = len(data)
+        timeout = 0
 
         while data_len:
-            with self.tx_cond:
+            # wait for ctrl flow msg
+            timeout = 0 if self.flow_ctrl_ok.wait(0.01) else (timeout+1)
 
-                # wait for ctrl flow msg
-                if self.tx_cond.wait_for(lambda: self.flow_ctrl_ok, 2):
+            if timeout == 0:
+                # send consecutive frame
+                data = self.writeConsecutiveFrame(data)
+                data_len = len(data)
+                time.sleep(self.st_min_for_tx)
+                block_count += 1
+                # all blocks sent, wait for ctrl flow again
+                if block_count % self.blk_size_for_tx == 0:
+                    self.flow_ctrl_ok.clear()
+                    block_count = 0
 
-                    # send consecutive frame
-                    data = self.writeConsecutiveFrame(data)
-                    data_len = len(data)
-                    time.sleep(self.st_min_for_tx)
-                    block_count += 1
+            elif timeout > 10:
+                self.logger.log_error("CANTP::writeMultiFrame : flow ctrl timeout")
+                break
 
-                    # all blocks sent, wait for ctrl flow again
-                    if block_count % self.blk_size_for_tx == 0:
-                        self.flow_ctrl_ok  = False
-                        block_count = 0
-                
-                # timeout occurred
-                else:
-                    print("flow ctrl timeout!")
-                    break
-
-    # API for writing data
+    # -- API for writing data --
     def sendData(self, data):
         if len(data) < 8:
             self.writeSingleFrame(data)
         else:
             th = Thread(target=self.writeMultiFrame(data))
             th.start()
-            th.join()
-
 
 class DiagRx(CANTP.Observer):
     def on_cantp_msg_received(self, data):
