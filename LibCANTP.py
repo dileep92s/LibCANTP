@@ -178,7 +178,7 @@ class DiagRx(CANTP.Observer):
 
 
 # ------------------- TESTING ------------------- #
-rx = DiagRx(CANTP.Observer)
+rx = DiagRx(    )
 
 bus2 = can.Bus('test', bustype='virtual')
 tp2 = CANTP(bus2, 0x72F, 0x727)
